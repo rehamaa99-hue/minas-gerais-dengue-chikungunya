@@ -1,0 +1,1242 @@
+---
+title: 'Minas Gerais: Dengue and Chikungunya'
+subtitle: Pooled municipal analysis, 2021–2025
+output:
+  html_document: default
+---
+
+# Setup
+
+```{r setup}
+library(geobr)
+library(sf)
+library(INLA)
+library(combinat)
+library(leaflet)
+library(ggplot2)
+years <- 2021:2025
+diseases <- c("dengue", "chikungunya")
+path <- "."
+unzip("inputs.zip", exdir = path)
+
+dir.create(file.path(path, "data/raw"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(path, "data/processed"), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Municipalities
+
+```{r municipalities}
+file <- file.path(path, "data/raw/boundaries.rds")
+if (!file.exists(file)) {
+  map <- read_municipality(code_muni = 31, year = 2020)
+  saveRDS(map, file)
+}
+
+map <- readRDS(file)
+codes <- as.character(map$code_muni)
+length(codes)
+```
+
+# Weekly reported cases
+
+```{r weekly-cases}
+options(timeout = 300)
+weekly <- data.frame()
+
+for (code in codes) {
+  for (disease in diseases) {
+    file <- file.path(path, "data/raw",
+                      paste0(code, "_", disease, "_2021_2025.csv"))
+    url <- paste0("https://info.dengue.mat.br/api/alertcity?geocode=", code,
+                  "&disease=", disease,
+                  "&format=csv&ew_start=1&ew_end=53&ey_start=2021&ey_end=2025")
+
+    if (!file.exists(file)) download.file(url, file, mode = "wb", quiet = TRUE)
+    x <- read.csv(file)
+
+    weekly <- rbind(weekly, data.frame(
+      code = code, disease = disease,
+      year = x$SE %/% 100, week = x$SE %% 100, cases = x$casos
+    ))
+  }
+}
+```
+
+# Annual and pooled counts
+
+```{r annual-counts}
+annual <- aggregate(cases ~ code + disease + year, weekly,
+                    sum, na.action = na.pass)
+weeks <- aggregate(week ~ code + disease + year, weekly, length)
+annual <- merge(annual, weeks)
+annual <- merge(expand.grid(code = codes, disease = diseases, year = years),
+                annual, all.x = TRUE)
+
+annual$cases[is.na(annual$week) |
+               annual$week != ifelse(annual$year == 2025, 53, 52)] <- NA
+names(annual)[names(annual) == "week"] <- "weeks_received"
+
+write.csv(annual, file.path(path, "data/processed/annual_cases.csv"),
+          row.names = FALSE)
+```
+
+```{r pooled-counts}
+pooled <- aggregate(cases ~ code + disease, annual,
+                    sum, na.action = na.pass)
+write.csv(pooled, file.path(path, "data/processed/pooled_cases.csv"),
+          row.names = FALSE)
+
+counts <- data.frame()
+for (disease in diseases) {
+  x <- pooled$cases[pooled$disease == disease]
+  counts <- rbind(counts, data.frame(
+    disease = disease,
+    complete = sum(!is.na(x)),
+    missing = sum(is.na(x)),
+    zero = sum(x == 0, na.rm = TRUE),
+    positive = sum(x > 0, na.rm = TRUE),
+    zero_percent = 100 * sum(x == 0, na.rm = TRUE) / sum(!is.na(x)),
+    total_cases = sum(x)
+  ))
+}
+counts
+```
+
+# Annual disease burden
+
+```{r annual-disease-burden}
+burden <- aggregate(cases ~ year + disease, annual, sum, na.action = na.pass)
+burden <- reshape(burden, idvar = "year", timevar = "disease", direction = "wide")
+burden <- burden[order(burden$year), ]
+
+matplot(burden$year, burden[c("cases.dengue", "cases.chikungunya")],
+        type = "l", xlab = "Year", ylab = "Reported cases")
+legend("topleft", legend = c("Dengue", "Chikungunya"), col = 1:2, lty = 1:2)
+
+```
+
+# Expected counts and SIRs
+
+```{r population}
+population <- read.csv2(file.path(path, "data/raw/population_tabnet.csv"),
+                        na.strings = "-", fileEncoding = "UTF-8")
+population$code <- codes[match(substr(population[[1]], 1, 6), substr(codes, 1, 6))]
+population <- population[!is.na(population$code), ]
+population$person_years <- rowSums(population[paste0("X", years)])
+population <- population[c("code", "person_years")]
+```
+
+```{r expected-counts-sir}
+rates <- aggregate(cases ~ disease, pooled, sum, na.action = na.pass)
+rates$rate <- rates$cases / sum(population$person_years)
+
+sir <- merge(pooled, population, by = "code", all.x = TRUE)
+sir$E <- sir$person_years * rates$rate[match(sir$disease, rates$disease)]
+sir$SIR <- sir$cases / sir$E
+sir$municipality <- map$name_muni[match(sir$code, codes)]
+sir <- sir[c("code", "municipality", "disease", "cases", "person_years", "E", "SIR")]
+
+write.csv(sir, file.path(path, "data/processed/expected_counts_SIR.csv"),
+          row.names = FALSE)
+```
+
+# Shared map style
+
+```{r map-display}
+library(leaflet)
+maps_dir <- file.path(path, "results/maps")
+dir.create(maps_dir, recursive = TRUE, showWarnings = FALSE)
+map_web <- st_transform(map, 4326)
+bounds <- st_bbox(map_web)
+risk_breaks <- c(0, 0.3, 0.6, 0.9, 1.1, 1.5, 2, 5, 10, Inf)
+risk_labels <- c("0 to <0.3", "0.3 to <0.6", "0.6 to <0.9", "0.9 to <1.1",
+                 "1.1 to <1.5", "1.5 to <2", "2 to <5", "5 to <10", ">=10")
+risk_colors <- c("#294563", "#5985AE", "#A4CCE5", "#F7F7F7", "#F4A582",
+                 "#E45A4F", "#B62828", "#8D1C24", "#5D191A")
+risk_palette <- colorBin(risk_colors, bins = risk_breaks, right = FALSE, na.color = "#999999")
+map_css <- htmltools::tags$style(htmltools::HTML(
+  ".info.legend {font: 20px/26px Arial; padding: 12px; color: #222;}
+   .info.legend i {width: 22px; height: 24px; margin-right: 8px;}
+   .leaflet-control-scale-line {font-size: 15px; line-height: 18px;}
+   .leaflet-control-attribution {font-size: 12px;}"))
+```
+
+## SIR maps
+
+```{r sir-map}
+sir_maps <- list()
+for (disease in diseases) {
+  x <- map_web
+  rows <- sir[sir$disease == disease, ]
+  x$value <- rows$SIR[match(codes, rows$code)]
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~risk_palette(value), fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": SIR = ", round(value, 2))) |>
+    addLegend(position = "bottomright", colors = risk_colors, labels = risk_labels,
+      opacity = 0.95, title = "SIR") |>
+    addControl(paste0("<b style='font-size:26px'>", tools::toTitleCase(disease),
+      "</b><br>SIR | Minas Gerais, 2021-2025"), position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  sir_maps[[disease]] <- p
+  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0("SIR_", disease, "_osm.html")),
+                         selfcontained = FALSE, libdir = "leaflet_libs")
+}
+htmltools::tagList(sir_maps)
+```
+
+### Static SIR maps
+
+```{r sir-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+for (disease in diseases) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0("SIR_", disease, "_osm.html")),
+    file = file.path(maps_dir, paste0("SIR_", disease, "_osm.png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (disease in diseases) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(
+    file.path(maps_dir, paste0("SIR_", disease, "_osm.png"))
+  ))
+}
+```
+
+## Five highest SIRs per disease
+
+```{r top-five-sir}
+top <- sir[order(sir$SIR, decreasing = TRUE), c("municipality", "disease", "cases", "E", "SIR")]
+```
+
+### Dengue
+
+```{r top-five-dengue}
+knitr::kable(head(top[top$disease == "dengue", c("municipality", "cases", "E", "SIR")], 5),
+             digits = 2, row.names = FALSE)
+```
+
+### Chikungunya
+
+```{r top-five-chikungunya}
+knitr::kable(head(top[top$disease == "chikungunya", c("municipality", "cases", "E", "SIR")], 5),
+             digits = 2, row.names = FALSE)
+```
+
+```{r}
+dengue <- subset(sir, disease == "dengue" & SIR > 1)$code
+chikungunya <- subset(sir, disease == "chikungunya" & SIR > 1)$code
+
+overlap <- intersect(dengue, chikungunya)
+
+length(overlap)
+round(100 * length(overlap) / length(unique(sir$code)), 1)
+
+```
+
+# Temperature and relative humidity availability
+
+```{r climate-data}
+library(ggplot2)
+
+fields <- c("tempmin", "tempmed", "tempmax", "umidmin", "umidmed", "umidmax")
+climate <- data.frame()
+
+for (code in sort(codes)) {
+  x <- read.csv(file.path(path, "data/raw", paste0(code, "_dengue_2021_2025.csv")))
+  climate <- rbind(climate, data.frame(code = code, date = as.Date(x$data_iniSE),
+                                      year = x$SE %/% 100, x[fields]))
+}
+
+climate <- reshape(climate, varying = fields, v.names = "value",
+                   timevar = "variable", times = fields,
+                   idvar = c("code", "date"), direction = "long")
+climate$available <- is.finite(climate$value)
+climate$variable <- factor(climate$variable, levels = fields,
+                           labels = c("Minimum temperature", "Mean temperature", "Maximum temperature",
+                                      "Minimum relative humidity", "Mean relative humidity", "Maximum relative humidity"))
+```
+
+```{r climate-yearly-coverage}
+climate_years <- aggregate(available ~ year + code + variable, climate, sum)
+names(climate_years)[2] <- "municipality_code"
+climate_years$completeness <- climate_years$available /
+  ifelse(climate_years$year == 2025, 53, 52)
+period <- "2021–2025"
+```
+
+```{r climate-availability, fig.width=12, fig.height=8, dpi=150}
+p <- ggplot(climate_years, aes(factor(year), municipality_code, fill = completeness)) +
+  geom_tile() + facet_wrap(~variable, ncol = 3) +
+  scale_fill_viridis_c(limits = c(0, 1), na.value = "grey85") +
+  labs(x = "Year", y = "Municipality", fill = "Weekly coverage",
+       title = paste("Climate availability,", period)) +
+  theme_minimal() + theme(axis.text.y = element_blank(), panel.grid = element_blank())
+print(p)
+ggsave(file.path(path, "climate_availability.png"), p, width = 12, height = 8)
+```
+
+# Rainfall, municipal HDI, vegetation, water piping, sewage, waste, and rurality
+
+```{r rainfall-hdi-import}
+rain <- read.csv(file.path(path, "data/raw/Sertao_Pluvial_Dados-3.csv"),
+                 fileEncoding = "UTF-8-BOM", check.names = FALSE)
+rain <- rain[rain$UF == "MG", ]
+names(rain)[1] <- "municipality"
+months <- c("Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+            "Jul", "Ago", "Set", "Out", "Nov", "Dez")
+for (month in months) {
+  rain[[month]] <- as.numeric(gsub(",", ".", gsub(".", "", rain[[month]], fixed = TRUE),
+                                   fixed = TRUE))
+}
+rain$rainfall_mm <- rowSums(rain[months])
+
+hdi <- as.data.frame(readxl::read_excel(file.path(path, "data/raw/data-3.xlsx")))
+names(hdi) <- c("municipality", "idhm_2010")
+hdi <- hdi[grepl(" (MG)", hdi$municipality, fixed = TRUE), ]
+hdi$municipality <- sub(" (MG)", "", hdi$municipality, fixed = TRUE)
+
+vegetation <- as.data.frame(readxl::read_excel(file.path(path, "data/raw/data-6.xlsx")))
+names(vegetation) <- c("municipality", "vegetation_2017")
+vegetation <- vegetation[grepl(" (MG)", vegetation$municipality, fixed = TRUE), ]
+vegetation$municipality <- sub(" (MG)", "", vegetation$municipality, fixed = TRUE)
+
+water <- read.csv2(file.path(path, "data/raw/tabela6804.csv"), skip = 5,
+                   header = FALSE, fill = TRUE,
+                   col.names = c("municipality", "piping", "no_piped_water_2022"))
+water <- water[grepl(" (MG)", water$municipality, fixed = TRUE) &
+                 water$piping == "Sem água canalizada", ]
+water$municipality <- sub(" (MG)", "", water$municipality, fixed = TRUE)
+water$municipality[water$municipality == "Barão do Monte Alto"] <- "Barão de Monte Alto"
+water$municipality[water$municipality == "Olhos-d'Água"] <- "Olhos-D'água"
+water$no_piped_water_2022[water$no_piped_water_2022 == "-"] <- "0"
+water$no_piped_water_2022 <- as.numeric(sub(",", ".", water$no_piped_water_2022, fixed = TRUE))
+
+sewage <- as.data.frame(readxl::read_excel(file.path(path, "data/raw/tabela6805.xlsx"),
+  sheet = "Tabela", skip = 5, col_names = c("municipality", "connected_pct")))
+sewage <- sewage[grepl(" (MG)", sewage$municipality, fixed = TRUE), ]
+sewage$municipality <- sub(" (MG)", "", sewage$municipality, fixed = TRUE)
+sewage$municipality[sewage$municipality == "Barão do Monte Alto"] <- "Barão de Monte Alto"
+sewage$municipality[sewage$municipality == "Olhos-d'Água"] <- "Olhos-D'água"
+sewage$no_sewer_2022 <- 100 - as.numeric(sewage$connected_pct)
+
+waste <- as.data.frame(readxl::read_excel(file.path(path, "data/raw/tabela6892.xlsx"),
+  sheet = "Tabela", skip = 5, col_names = c("municipality", "collected_pct")))
+waste <- waste[grepl(" (MG)", waste$municipality, fixed = TRUE), ]
+waste$municipality <- sub(" (MG)", "", waste$municipality, fixed = TRUE)
+waste$municipality[waste$municipality == "Barão do Monte Alto"] <- "Barão de Monte Alto"
+waste$municipality[waste$municipality == "Olhos-d'Água"] <- "Olhos-D'água"
+waste$no_waste_collection_2022 <- 100 - as.numeric(waste$collected_pct)
+
+rural <- as.data.frame(readxl::read_excel(file.path(path, "data/raw/tabela9923.xlsx"),
+  sheet = "Tabela", range = "A6:B860", col_names = c("municipality", "rural_pct_2022")))
+rural <- rural[grepl(" (MG)", rural$municipality, fixed = TRUE), ]
+rural$municipality <- sub(" (MG)", "", rural$municipality, fixed = TRUE)
+rural$municipality[rural$municipality == "Barão do Monte Alto"] <- "Barão de Monte Alto"
+rural$municipality[rural$municipality == "Olhos-d'Água"] <- "Olhos-D'água"
+rural$rural_pct_2022[rural$rural_pct_2022 == "-"] <- "0"
+rural$rural_pct_2022 <- as.numeric(rural$rural_pct_2022)
+```
+
+```{r rainfall-hdi-municipalities}
+old <- c("Brasópolis", "Dona Eusébia", "Olhos d'Água", "Olhos-D'Água",
+         "Passa-Vinte", "Pingo-d'Água", "Pingo-D'Água", "São João Del Rei",
+         "São Thomé das Letras")
+new <- c("Brazópolis", "Dona Euzébia", "Olhos-D'água", "Olhos-D'água",
+         "Passa Vinte", "Pingo-D'água", "Pingo-D'água", "São João del Rei",
+         "São Tomé das Letras")
+for (i in seq_along(old)) {
+  rain$municipality[rain$municipality == old[i]] <- new[i]
+  hdi$municipality[hdi$municipality == old[i]] <- new[i]
+  vegetation$municipality[vegetation$municipality == old[i]] <- new[i]
+  water$municipality[water$municipality == old[i]] <- new[i]
+  sewage$municipality[sewage$municipality == old[i]] <- new[i]
+  waste$municipality[waste$municipality == old[i]] <- new[i]
+  rural$municipality[rural$municipality == old[i]] <- new[i]
+}
+
+covariates <- data.frame(code = codes, municipality = map$name_muni)
+covariates$rainfall_mm <- rain$rainfall_mm[match(covariates$municipality, rain$municipality)]
+covariates$idhm_2010 <- hdi$idhm_2010[match(covariates$municipality, hdi$municipality)]
+covariates$vegetation_2017 <- vegetation$vegetation_2017[
+  match(covariates$municipality, vegetation$municipality)]
+covariates$no_piped_water_2022 <- water$no_piped_water_2022[
+  match(covariates$municipality, water$municipality)]
+covariates$no_sewer_2022 <- sewage$no_sewer_2022[
+  match(covariates$municipality, sewage$municipality)]
+covariates$no_waste_collection_2022 <- waste$no_waste_collection_2022[
+  match(covariates$municipality, waste$municipality)]
+covariates$rural_pct_2022 <- rural$rural_pct_2022[
+  match(covariates$municipality, rural$municipality)]
+write.csv(covariates, file.path(path, "data/processed/rainfall_hdi.csv"), row.names = FALSE)
+```
+
+# Population density
+
+```{r population-density}
+covariates$area_km2 <- as.numeric(st_area(st_transform(map,
+  "+proj=laea +lat_0=-19 +lon_0=-44 +datum=WGS84 +units=m +no_defs"))) / 1e6
+covariates$mean_population <- population$person_years[match(covariates$code, population$code)] /
+  length(years)
+covariates$population_density <- covariates$mean_population / covariates$area_km2
+covariates$log_population_density <- log(covariates$population_density)
+
+```
+
+# Complete the covariate dataset
+
+```{r selected-climate-covariates}
+temp <- aggregate(value ~ code,
+                  climate[climate$variable == "Minimum temperature" & climate$available, ], mean)
+humidity <- aggregate(value ~ code,
+                      climate[climate$variable == "Maximum relative humidity" & climate$available, ], mean)
+covariates$tempmin_mean <- temp$value[match(covariates$code, temp$code)]
+covariates$umidmax_mean <- humidity$value[match(covariates$code, humidity$code)]
+
+variables <- c("tempmin_mean", "umidmax_mean", "log_population_density", "rainfall_mm",
+               "idhm_2010", "vegetation_2017", "no_piped_water_2022", "no_sewer_2022",
+               "no_waste_collection_2022", "rural_pct_2022")
+write.csv(covariates, file.path(path, "data/processed/covariates.csv"), row.names = FALSE)
+```
+
+# Covariate maps
+
+```{r covariate-maps}
+labels <- c("Minimum temperature, 2021–2025", "Maximum relative humidity, 2021–2025",
+            "Log population density, 2021–2025", "Rainfall", "Municipal HDI, 2010",
+            "Natural vegetation cover, 2017", "Households without piped water, 2022",
+            "Households without general/stormwater network connection, 2022",
+            "Households without waste collection, 2022", "Rural population, 2022")
+units <- c("°C", "%", "ln(residents/km²)", "mm", "IDHM (0–1)", "%", "%", "%", "%", "%")
+covariate_maps <- list()
+for (j in seq_along(variables)) {
+  x <- map_web
+  x$value <- covariates[[variables[j]]][match(codes, covariates$code)]
+  palette <- colorBin(risk_colors, domain = x$value, bins = 9,
+                      pretty = FALSE, right = FALSE, na.color = "#999999")
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~palette(value), fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": ", round(value, 3))) |>
+    addLegend(position = "bottomright", pal = palette, values = ~value,
+      opacity = 0.95, title = units[j]) |>
+    addControl(paste0("<b style='font-size:26px'>", labels[j],
+      "</b><br>Minas Gerais"), position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  covariate_maps[[j]] <- p
+  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0(variables[j], "_osm.html")),
+                         selfcontained = FALSE, libdir = "leaflet_libs")
+}
+summary(covariates)
+htmltools::tagList(covariate_maps)
+```
+
+### Static maps
+
+```{r covariate-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- paste0(variables, "_osm")
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+```
+
+# Covariate correlation heatmap
+
+```{r covariate-correlations, fig.width=16, fig.height=9}
+values <- covariates[variables]
+names(values) <- c("Minimum\ntemperature", "Maximum\nhumidity", "Log population\ndensity",
+                   "Rainfall", "IDHM 2010", "Vegetation\n2017", "No piped water\n2022",
+                   "No sewer network\n2022", "No waste collection\n2022", "Rural population\n2022")
+n <- crossprod(!is.na(as.matrix(values)))
+correlations <- data.frame()
+
+for (method in c("pearson", "spearman")) {
+  x <- as.data.frame(as.table(cor(values, use = "pairwise.complete.obs", method = method)))
+  names(x) <- c("variable_1", "variable_2", "correlation")
+  x$n <- as.vector(n)
+  x$method <- method
+  correlations <- rbind(correlations, x)
+}
+correlations$method <- factor(correlations$method, levels = c("pearson", "spearman"),
+                              labels = c("Pearson", "Spearman"))
+correlations$variable_2 <- factor(correlations$variable_2, levels = rev(names(values)))
+
+plot_data <- correlations[match(correlations$variable_2, names(values)) >
+                            match(correlations$variable_1, names(values)), ]
+
+p <- ggplot(plot_data, aes(variable_1, variable_2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", correlation)), size = 3) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_discrete(drop = FALSE) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1)) +
+  facet_wrap(~method, nrow = 1) +
+  coord_fixed() +
+  labs(x = NULL, y = NULL, fill = "Correlation", title = "Municipal covariate correlations") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+ggsave(file.path(path, "covariate_correlations.png"), p, width = 16, height = 9)
+write.csv(correlations, file.path(path, "data/processed/covariate_correlations.csv"), row.names = FALSE)
+```
+
+# Scale the covariates
+
+```{r scale-covariates}
+z <- scale(covariates[variables])
+scaling <- data.frame(variable = variables,
+                      mean = attr(z, "scaled:center"), sd = attr(z, "scaled:scale"))
+scaled <- data.frame(code = covariates$code, z)
+names(scaled)[-1] <- paste0("z_", variables)
+write.csv(scaled, file.path(path, "data/processed/scaled_covariates.csv"), row.names = FALSE)
+write.csv(scaling, file.path(path, "data/processed/covariate_scaling.csv"), row.names = FALSE)
+knitr::kable(scaling, digits = 3, row.names = FALSE)
+```
+
+# Queen-contiguity graph
+
+```{r queen-adjacency, fig.width=9, fig.height=7}
+library(spdep)
+
+graph_map <- st_transform(map, 31983)
+nb <- poly2nb(graph_map, queen = TRUE, row.names = codes)
+xy <- st_coordinates(st_point_on_surface(st_geometry(graph_map)))
+nb2INLA(file.path(path, "data/processed/queen.graph"), nb)
+links <- nb2lines(nb, coords = xy, proj4string = st_crs(graph_map), as_sf = TRUE)
+links <- st_transform(links, 4326)
+points <- st_transform(st_as_sf(data.frame(x = xy[, 1], y = xy[, 2]),
+                                coords = c("x", "y"), crs = 31983), 4326)
+
+adjacency_map <- leaflet(map_web, width = 1200, height = 1000,
+  options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+  addTiles() |>
+  fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+            bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+  addPolygons(fillColor = "white", fillOpacity = 0.6, color = "#888888", weight = 0.5) |>
+  addPolylines(data = links, color = "#294563", weight = 1, opacity = 0.8) |>
+  addCircleMarkers(data = points, radius = 2, color = "#294563", stroke = FALSE, fillOpacity = 1) |>
+  addControl("<b style='font-size:26px'>Municipal adjacency</b><br>Queen contiguity | Minas Gerais",
+             position = "topleft") |>
+  addLegend(position = "bottomright", colors = c("#888888", "#294563"),
+            labels = c("Municipal boundaries", "Neighbour links"), opacity = 1) |>
+  addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+adjacency_map <- htmlwidgets::prependContent(adjacency_map, map_css)
+htmlwidgets::saveWidget(adjacency_map, file.path(maps_dir, "adjacency_osm.html"),
+                       selfcontained = FALSE, libdir = "leaflet_libs")
+adjacency_map
+```
+
+### Static maps
+
+```{r adjacency-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- "adjacency_osm"
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+```
+
+# Joint model data
+
+```{r sensitivity-model-data}
+library(INLA)
+
+graph <- inla.read.graph(file.path(path, "data/processed/queen.graph"))
+n <- length(codes)
+model_data <- merge(sir, scaled, by = "code")
+model_data$disease <- factor(model_data$disease, levels = diseases)
+model_data$area <- match(model_data$code, codes)
+model_data <- model_data[order(model_data$disease, model_data$area), ]
+model_data$int_dengue <- as.integer(model_data$disease == "dengue")
+model_data$int_chikungunya <- as.integer(model_data$disease == "chikungunya")
+model_data$Y_dengue <- ifelse(model_data$int_dengue == 1, model_data$cases, NA)
+model_data$Y_chikungunya <- ifelse(model_data$int_chikungunya == 1, model_data$cases, NA)
+model_data$b1 <- ifelse(model_data$int_dengue == 1, model_data$area, NA)
+model_data$b2 <- ifelse(model_data$int_chikungunya == 1, model_data$area, NA)
+model_data$shared <- model_data$b2
+write.csv(model_data, file.path(path, "data/processed/model_data.csv"), row.names = FALSE)
+```
+
+# Common model specification and sigma_wider priors
+
+```{r reference-model}
+selection_prior <- list(
+  prec = list(prior = "pc.prec", param = c(2, 0.01)),
+  phi = list(prior = "pc", param = c(0.5, 2/3))
+)
+
+selection_base <- cbind(Y_dengue, Y_chikungunya) ~
+  -1 + int_dengue + int_chikungunya +
+  f(b1, model = "bym2", graph = graph, n = n,
+    scale.model = TRUE, constr = TRUE, hyper = selection_prior) +
+  f(b2, model = "bym2", graph = graph, n = n,
+    scale.model = TRUE, constr = TRUE, hyper = selection_prior) +
+  f(shared, copy = "b1",
+    hyper = list(beta = list(prior = "normal", param = c(0, 1), fixed = FALSE)))
+
+full_formula <- update(selection_base,
+  paste(". ~ . +", paste(paste0("z_", variables), collapse = " + ")))
+```
+
+# Full model: posterior inference
+
+```{r full-model-posterior, eval=FALSE}
+full_fit <- inla(
+  full_formula,
+  family = c("poisson", "poisson"),
+  data = model_data,
+  E = model_data$E,
+  control.fixed = list(mean = 0, prec = list(default = 1,
+    int_dengue = 1/2.5^2, int_chikungunya = 1/2.5^2)),
+  control.predictor = list(compute = TRUE),
+  control.compute = list(waic = TRUE, dic = TRUE)
+)
+
+knitr::kable(full_fit$summary.fixed, digits = 3)
+knitr::kable(full_fit$summary.hyperpar, digits = 3)
+knitr::kable(data.frame(WAIC = full_fit$waic$waic, DIC = full_fit$dic$dic), digits = 3)
+```
+
+# Model selection: correlation screening and six candidates
+
+```{r correlation-screening-six-models, eval=FALSE}
+vars <- c(
+  "z_tempmin_mean", "z_umidmax_mean", "z_log_population_density",
+  "z_rainfall_mm", "z_idhm_2010", "z_vegetation_2017",
+  "z_no_piped_water_2022", "z_no_sewer_2022",
+  "z_no_waste_collection_2022", "z_rural_pct_2022"
+)
+
+correlation <- cor(scaled[vars], method = "pearson")
+pairs <- which(
+  abs(correlation) >= 0.7 & upper.tri(correlation),
+  arr.ind = TRUE
+)
+
+print(data.frame(
+  variable_1 = rownames(correlation)[pairs[, 1]],
+  variable_2 = colnames(correlation)[pairs[, 2]],
+  correlation = correlation[pairs]
+), row.names = FALSE)
+
+common <- c(
+  "z_umidmax_mean", "z_log_population_density",
+  "z_vegetation_2017", "z_no_piped_water_2022"
+)
+
+candidates <- list(
+  temp_idhm_rural = c(
+    "z_tempmin_mean", "z_idhm_2010", "z_rural_pct_2022"
+  ),
+  temp_idhm_sewer = c(
+    "z_tempmin_mean", "z_idhm_2010", "z_no_sewer_2022"
+  ),
+  temp_waste_sewer = c(
+    "z_tempmin_mean", "z_no_waste_collection_2022", "z_no_sewer_2022"
+  ),
+  rain_idhm_rural = c(
+    "z_rainfall_mm", "z_idhm_2010", "z_rural_pct_2022"
+  ),
+  rain_idhm_sewer = c(
+    "z_rainfall_mm", "z_idhm_2010", "z_no_sewer_2022"
+  ),
+  rain_waste_sewer = c(
+    "z_rainfall_mm", "z_no_waste_collection_2022", "z_no_sewer_2022"
+  )
+)
+
+waic_comparison <- data.frame()
+best_waic <- Inf
+
+for (candidate in names(candidates)) {
+  terms <- paste(c(common, candidates[[candidate]]), collapse = " + ")
+  selection_formula <- update(selection_base, paste(". ~ . +", terms))
+
+  fit <- inla(
+    selection_formula,
+    family = c("poisson", "poisson"),
+    data = model_data,
+    E = model_data$E,
+    control.fixed = list(
+      mean = 0,
+      prec = list(
+        default = 1,
+        int_dengue = 1/2.5^2,
+        int_chikungunya = 1/2.5^2
+      )
+    ),
+    control.compute = list(waic = TRUE)
+  )
+
+  waic_comparison <- rbind(
+    waic_comparison,
+    data.frame(
+      model = candidate,
+      covariates = terms,
+      WAIC = fit$waic$waic
+    )
+  )
+
+  if (fit$waic$waic < best_waic) {
+    best_waic <- fit$waic$waic
+    best_fit <- fit
+    best_formula <- selection_formula
+    selected_vars <- c(common, candidates[[candidate]])
+  }
+}
+
+waic_comparison <- waic_comparison[order(waic_comparison$WAIC), ]
+rownames(waic_comparison) <- NULL
+waic_comparison$delta_WAIC <- waic_comparison$WAIC - best_waic
+
+print(waic_comparison[c("model", "WAIC", "delta_WAIC")],
+      row.names = FALSE)
+
+print(waic_comparison[1, ], row.names = FALSE)
+selected_vars
+retained_vars <- selected_vars
+candidate_fit <- best_fit
+candidate_formula <- best_formula
+```
+
+# Retained seven-covariate model: posterior inference
+
+```{r seven-covariate-posterior, eval=FALSE}
+retained_formula <- update(selection_base, paste(". ~ . +", paste(retained_vars, collapse = " + ")))
+
+retained_fit <- inla(
+  retained_formula,
+  family = c("poisson", "poisson"),
+  data = model_data,
+  E = model_data$E,
+  control.fixed = list(
+    mean = 0,
+    prec = list(
+      default = 1,
+      int_dengue = 1/2.5^2,
+      int_chikungunya = 1/2.5^2
+    )
+  ),
+  control.predictor = list(compute = TRUE),
+  control.compute = list(waic = TRUE, dic = TRUE)
+)
+
+retained_fit$summary.fixed
+retained_fit$summary.hyperpar
+retained_fit$waic$waic
+retained_fit$dic$dic
+```
+
+# Model selection: all 128 subsets of the seven covariates
+
+```{r seven-covariate-128-subsets, eval=FALSE}
+library(combinat)
+
+vars <- c(
+  "z_umidmax_mean", "z_log_population_density",
+  "z_vegetation_2017", "z_no_piped_water_2022",
+  "z_rainfall_mm", "z_idhm_2010", "z_no_sewer_2022"
+)
+
+subsets <- list(character(0))
+for (k in seq_along(vars)) {
+  subsets <- c(subsets, combinat::combn(vars, k, simplify = FALSE))
+}
+
+selection_prior <- list(
+  prec = list(prior = "pc.prec", param = c(2, 0.01)),
+  phi = list(prior = "pc", param = c(0.5, 2/3))
+)
+
+base_formula <- cbind(Y_dengue, Y_chikungunya) ~
+  -1 + int_dengue + int_chikungunya +
+  f(b1, model = "bym2", graph = graph, n = n,
+    scale.model = TRUE, constr = TRUE, hyper = selection_prior) +
+  f(b2, model = "bym2", graph = graph, n = n,
+    scale.model = TRUE, constr = TRUE, hyper = selection_prior) +
+  f(shared, copy = "b1",
+    hyper = list(beta = list(prior = "normal", param = c(0, 1), fixed = FALSE)))
+
+subset_comparison <- data.frame()
+best_waic <- Inf
+
+for (i in seq_along(subsets)) {
+  formula <- base_formula
+  terms <- "None"
+
+  if (length(subsets[[i]]) > 0) {
+    terms <- paste(subsets[[i]], collapse = " + ")
+    formula <- update(base_formula, paste(". ~ . +", terms))
+  }
+
+  cat("Fitting model", i, "of", length(subsets), ":", terms, "\n")
+
+  fit <- inla(
+    formula,
+    family = c("poisson", "poisson"),
+    data = model_data,
+    E = model_data$E,
+    control.fixed = list(
+      mean = 0,
+      prec = list(
+        default = 1,
+        int_dengue = 1/2.5^2,
+        int_chikungunya = 1/2.5^2
+      )
+    ),
+    control.compute = list(waic = TRUE)
+  )
+
+  subset_comparison <- rbind(
+    subset_comparison,
+    data.frame(
+      model = i,
+      n_covariates = length(subsets[[i]]),
+      covariates = terms,
+      WAIC = fit$waic$waic
+    )
+  )
+
+  cat("WAIC:", fit$waic$waic, "\n")
+
+  if (fit$waic$waic < best_waic) {
+    best_waic <- fit$waic$waic
+    best_fit <- fit
+    best_formula <- formula
+    selected_vars <- subsets[[i]]
+  }
+}
+
+subset_comparison <- subset_comparison[order(subset_comparison$WAIC), ]
+rownames(subset_comparison) <- NULL
+subset_comparison$delta_WAIC <- subset_comparison$WAIC - best_waic
+
+print(subset_comparison, row.names = FALSE, max = nrow(subset_comparison) * ncol(subset_comparison))
+
+print(subset_comparison[1, ], row.names = FALSE)
+best_formula
+best_fit$summary.fixed
+best_fit$summary.hyperpar
+```
+
+# Lowest-WAIC subset: posterior inference
+
+```{r selected-model-posterior, eval=FALSE}
+lincomb <- inla.make.lincombs(shared = diag(n), b2 = diag(n))
+names(lincomb) <- codes
+
+selected_fit <- inla(
+  best_formula,
+  family = c("poisson", "poisson"),
+  data = model_data,
+  E = model_data$E,
+  lincomb = lincomb,
+  control.fixed = list(mean = 0, prec = list(default = 1,
+    int_dengue = 1/2.5^2, int_chikungunya = 1/2.5^2)),
+  control.predictor = list(compute = TRUE),
+  control.compute = list(waic = TRUE, dic = TRUE)
+)
+
+selected_vars
+best_formula
+knitr::kable(selected_fit$summary.fixed, digits = 3)
+knitr::kable(selected_fit$summary.hyperpar, digits = 3)
+knitr::kable(data.frame(WAIC = selected_fit$waic$waic,
+  DIC = selected_fit$dic$dic), digits = 3)
+```
+
+# RR and total random-effect maps
+
+## Relative risks for both diseases
+
+```{r selected-rr-maps, eval=FALSE}
+rr <- read.csv(file.path(path, "data/processed/posterior_relative_risks.csv"))
+rr_maps <- list()
+for (disease in diseases) {
+  x <- map_web
+  rows <- rr[rr$disease == disease, ]
+  x$value <- rows$RR[match(x$code_muni, rows$code)]
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~risk_palette(value), fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": RR = ", round(value, 2))) |>
+    addLegend(position = "bottomright", colors = risk_colors, labels = risk_labels,
+      opacity = 0.95, title = "Relative risk") |>
+    addControl(paste0("<b style='font-size:26px'>", tools::toTitleCase(disease),
+      "</b><br>Posterior mean RR | Minas Gerais, 2021-2025"), position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  rr_maps[[disease]] <- p
+  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0("RR_", disease, "_osm.html")),
+                         selfcontained = FALSE, libdir = "leaflet_libs")
+}
+htmltools::tagList(rr_maps)
+```
+
+### Static maps
+
+```{r rr-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- paste0("RR_", diseases, "_osm")
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+```
+
+## Total random-effect contributions
+
+```{r selected-random-effect-maps, eval=FALSE}
+fields <- c("b1", "chikungunya_total")
+field_labels <- c("Dengue random effect", "Chikungunya random effect")
+effect_breaks <- c(-Inf, -2, -1, -0.5, -0.1, 0.1, 0.5, 1, 2, Inf)
+effect_labels <- c("< -2", "-2 to < -1", "-1 to < -0.5", "-0.5 to < -0.1",
+                   "-0.1 to <0.1", "0.1 to <0.5", "0.5 to <1", "1 to <2", ">=2")
+effect_colors <- c("#294563", "#5985AE", "#A4CCE5", "#D1E5F0", "#F7F7F7",
+                   "#FDDBC7", "#E45A4F", "#B62828", "#681F23")
+effect_palette <- colorBin(effect_colors, bins = effect_breaks, right = FALSE)
+effect_maps <- list()
+for (j in seq_along(fields)) {
+  x <- map_web
+  if (j == 1) {
+    estimates <- selected_fit$summary.random$b1
+    x$value <- estimates[match(seq_along(codes), estimates$ID), "mean"]
+  } else {
+    estimates <- selected_fit$summary.lincomb.derived
+    x$value <- estimates[match(codes, rownames(estimates)), "mean"]
+  }
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~effect_palette(value), fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": ", round(value, 2))) |>
+    addLegend(position = "bottomright", colors = effect_colors, labels = effect_labels,
+      opacity = 0.95, title = "Log-risk effect") |>
+    addControl(paste0("<b style='font-size:26px'>", field_labels[j],
+      "</b><br>Posterior mean | Minas Gerais, 2021-2025"), position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  effect_maps[[j]] <- p
+  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0(fields[j], "_osm.html")),
+                         selfcontained = FALSE, libdir = "leaflet_libs")
+}
+htmltools::tagList(effect_maps)
+```
+
+### Static maps
+
+```{r random-effect-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- paste0(fields, "_osm")
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+```
+
+# Prior sensitivity: full ten-covariate model
+
+## Prior scenarios
+
+```{r prior-scenarios}
+scenarios <- data.frame(
+  scenario = c("reference", "phi_balanced", "phi_spatial", "phi_uniform", "sigma_tighter", "sigma_wider"),
+  sigma_u = c(1, 1, 1, 1, 0.5, 2),
+  sigma_alpha = 0.01,
+  phi_prior = c("pc", "pc", "pc", "uniform", "pc", "pc"),
+  phi_u = 0.5,
+  phi_alpha = c(2/3, 0.5, 0.1, NA, 2/3, 2/3)
+)
+knitr::kable(scenarios, digits = 3)
+sensitivity_dir <- file.path(path, "results/vegetation_water_sewage_waste_rural_2022")
+dir.create(sensitivity_dir, recursive = TRUE, showWarnings = FALSE)
+write.csv(scenarios, file.path(sensitivity_dir, "prior_scenarios.csv"), row.names = FALSE)
+```
+
+## Fit the six scenarios
+
+```{r fit-prior-scenarios}
+for (i in seq_len(nrow(scenarios))) {
+  prior <- list(
+    prec = list(prior = "pc.prec", param = c(scenarios$sigma_u[i], scenarios$sigma_alpha[i])),
+    phi = list(prior = "pc", param = c(scenarios$phi_u[i], scenarios$phi_alpha[i]))
+  )
+  if (scenarios$phi_prior[i] == "uniform") {
+    prior$phi <- list(prior = "logitbeta", param = c(1, 1))
+  }
+
+  formula <- cbind(Y_dengue, Y_chikungunya) ~ -1 + int_dengue + int_chikungunya +
+    z_tempmin_mean + z_umidmax_mean + z_log_population_density + z_rainfall_mm + z_idhm_2010 +
+    z_vegetation_2017 + z_no_piped_water_2022 + z_no_sewer_2022 +
+    z_no_waste_collection_2022 + z_rural_pct_2022 +
+    f(b1, model = "bym2", graph = graph, n = n, scale.model = TRUE, constr = TRUE, hyper = prior) +
+    f(b2, model = "bym2", graph = graph, n = n, scale.model = TRUE, constr = TRUE, hyper = prior) +
+    f(shared, copy = "b1", hyper = list(beta = list(prior = "normal", param = c(0, 1), fixed = FALSE)))
+
+  fit <- inla(formula, family = c("poisson", "poisson"), data = model_data, E = model_data$E,
+              control.fixed = list(mean = 0, prec = list(default = 1,
+                int_dengue = 1/2.5^2, int_chikungunya = 1/2.5^2)),
+              control.predictor = list(compute = TRUE),
+              control.compute = list(dic = TRUE, waic = TRUE))
+  saveRDS(fit, file.path(sensitivity_dir, paste0(scenarios$scenario[i], "_fit.rds")))
+}
+```
+
+## Compare predictive fit and posterior estimates
+
+```{r prior-comparison}
+comparison <- fixed <- hyper <- risks <- data.frame()
+for (scenario in scenarios$scenario) {
+  fit <- readRDS(file.path(sensitivity_dir, paste0(scenario, "_fit.rds")))
+  comparison <- rbind(comparison, data.frame(scenario = scenario,
+    WAIC = fit$waic$waic, DIC = fit$dic$dic, mode_status = fit$mode$mode.status))
+  fixed <- rbind(fixed, data.frame(scenario = scenario, parameter = rownames(fit$summary.fixed),
+    fit$summary.fixed[c("mean", "sd", "0.025quant", "0.975quant")], row.names = NULL))
+  hyper <- rbind(hyper, data.frame(scenario = scenario, parameter = rownames(fit$summary.hyperpar),
+    fit$summary.hyperpar[c("mean", "sd", "0.025quant", "0.975quant")], row.names = NULL))
+  risks <- rbind(risks, data.frame(scenario = scenario, model_data[c("code", "disease")],
+    RR_median = exp(fit$summary.linear.predictor[, "0.5quant"])))
+}
+names(fixed)[5:6] <- c("lower_95", "upper_95")
+names(hyper)[5:6] <- c("lower_95", "upper_95")
+comparison$delta_WAIC <- comparison$WAIC - min(comparison$WAIC)
+comparison <- comparison[order(comparison$WAIC), ]
+write.csv(comparison, file.path(sensitivity_dir, "prior_comparison.csv"), row.names = FALSE)
+write.csv(fixed, file.path(sensitivity_dir, "fixed_effects.csv"), row.names = FALSE)
+write.csv(hyper, file.path(sensitivity_dir, "hyperparameters.csv"), row.names = FALSE)
+write.csv(risks, file.path(sensitivity_dir, "relative_risks.csv"), row.names = FALSE)
+knitr::kable(comparison, digits = 3, row.names = FALSE)
+```
+
+# Posterior relative risks
+
+```{r}
+
+library(INLA)
+
+cutoff <- 0.98   # P(RR > 1 | data) > 0.98
+
+final_vars <- c("z_vegetation_2017", "z_rainfall_mm", "z_idhm_2010",
+                "z_no_piped_water_2022", "z_no_sewer_2022")
+final_formula <- update(selection_base, paste(". ~ . +", paste(final_vars, collapse = " + ")))
+
+fit_file <- file.path(path, "data/processed/final_fit_sampling.rds")
+final_fit <- inla(
+  final_formula,
+  family = c("poisson", "poisson"),
+  data = model_data,
+  E = model_data$E,
+  control.fixed = list(mean = 0, prec = list(default = 1,
+                       int_dengue = 1/2.5^2, int_chikungunya = 1/2.5^2)),
+  control.predictor = list(compute = TRUE),
+  control.compute = list(waic = TRUE, dic = TRUE, return.marginals.predictor = TRUE,
+                         config = TRUE)
+)
+saveRDS(final_fit, fit_file)
+
+eta <- final_fit$summary.linear.predictor
+set.seed(123)
+samples <- inla.posterior.sample(10000, final_fit, selection = list(Predictor = 0), seed = 123, num.threads = 1)
+
+index <- match(paste0("Predictor:", seq_len(nrow(model_data))),
+               rownames(samples[[1]]$latent))
+p_above_1 <- numeric(nrow(model_data))
+for (i in seq_along(samples)) {
+  rr_sample <- exp(samples[[i]]$latent[index, 1])
+  p_above_1 <- p_above_1 + (rr_sample > 1)
+}
+p_above_1 <- p_above_1 / length(samples)
+
+post <- data.frame(
+  model_data[c("code", "municipality", "disease", "cases", "E", "SIR")],
+  RR = final_fit$summary.fitted.values[, "mean"], lower = exp(eta[, "0.025quant"]), upper = exp(eta[, "0.975quant"]),
+  prob_RR_above_1 = p_above_1, row.names = NULL
+)
+write.csv(post, file.path(path, "data/processed/posterior_relative_risks.csv"), row.names = FALSE)
+
+den  <- post[post$disease == "dengue", ]
+chik <- post[post$disease == "chikungunya", ]
+stopifnot(nrow(den) == n, identical(den$code, chik$code))
+
+cols <- c("municipality", "cases", "E", "SIR", "RR", "lower", "upper")
+top  <- function(x, k = 5) head(x[order(-x$RR), cols], k)
+knitr::kable(top(den),  digits = 2, row.names = FALSE,
+             caption = "Dengue: five municipalities with the highest model-based relative risks")
+knitr::kable(top(chik), digits = 2, row.names = FALSE,
+             caption = "Chikungunya: five municipalities with the highest model-based relative risks")
+
+hi_d <- den$prob_RR_above_1 > cutoff
+hi_c <- chik$prob_RR_above_1 > cutoff
+knitr::kable(data.frame(disease = c("dengue", "chikungunya"),
+                        n = c(sum(hi_d), sum(hi_c)),
+                        pct = round(100 * c(mean(hi_d), mean(hi_c)), 1)), row.names = FALSE,
+             caption = "Municipalities with P(RR > 1 | data) > 0.98, by disease")
+
+both <- hi_d & hi_c
+both_tab <- data.frame(municipality = den$municipality, RR_dengue = den$RR,
+                       RR_chikungunya = chik$RR)[both, ]
+both_tab <- both_tab[order(-pmin(both_tab$RR_dengue, both_tab$RR_chikungunya)), ]
+cat("\nMunicipalities meeting the elevated-risk criterion separately for both diseases: count and percentage\n")
+c(n = sum(both), pct = round(100 * mean(both), 1))
+knitr::kable(head(both_tab, 5), digits = 2, row.names = FALSE,
+             caption = "Five municipalities meeting both elevated-risk criteria, ranked by the smaller of their two RRs")
+
+sir_both <- den$SIR > 1 & chik$SIR > 1
+cat("\nMunicipalities with raw SIR > 1 for both diseases: count and percentage\n")
+c(SIR_above_1_both_n = sum(sir_both), pct = round(100 * mean(sir_both), 1))
+
+by_sir <- function(x, k = 3) head(x[order(-x$SIR), cols], k)   # top SIRs and their smoothed RRs
+knitr::kable(by_sir(den),  digits = 2, row.names = FALSE,
+             caption = "Dengue: raw SIR and model-based RR in the three municipalities with the highest SIRs")
+knitr::kable(by_sir(chik), digits = 2, row.names = FALSE,
+             caption = "Chikungunya: raw SIR and model-based RR in the three municipalities with the highest SIRs")
+
+cat("\nSpearman rank correlation between raw SIR and model-based RR, by disease\n")
+sapply(list(dengue = den, chikungunya = chik),
+       function(x) cor(x$SIR, x$RR, method = "spearman"))
+
+```
+
+## Exceedance probability maps
+
+```{r sampled-exceedance-maps}
+exceedance_maps <- list()
+for (disease in diseases) {
+  x <- map_web
+  rows <- post[post$disease == disease, ]
+  x$probability <- rows$prob_RR_above_1[match(as.character(x$code_muni), rows$code)]
+  x$fill <- ifelse(x$probability > 0.98, "#B62828", "#F7F7F7")
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~fill, fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": P(RR > 1 | data) = ",
+                      round(100 * probability, 2), "%")) |>
+    addLegend(position = "bottomright", colors = c("#B62828", "#F7F7F7"),
+      labels = c(">98%", "<=98%"), opacity = 0.95,
+      title = "P(RR > 1 | data)") |>
+    addControl(paste0("<b style='font-size:26px'>", tools::toTitleCase(disease),
+      "</b><br>Exceedance probability >98% | Minas Gerais, 2021-2025"),
+      position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  exceedance_maps[[disease]] <- p
+  htmlwidgets::saveWidget(p,
+    file.path(maps_dir, paste0("exceedance_98_", disease, "_osm.html")),
+    selfcontained = FALSE, libdir = "leaflet_libs")
+}
+htmltools::tagList(exceedance_maps)
+```
+
+### Joint exceedance probability map
+
+```{r joint-exceedance-map}
+idx_d <- which(model_data$disease == "dengue")
+idx_c <- which(model_data$disease == "chikungunya")
+idx_c <- idx_c[match(model_data$code[idx_d], model_data$code[idx_c])]
+
+joint_prob <- numeric(length(idx_d))
+for (i in seq_along(samples)) {
+  rr_d <- exp(samples[[i]]$latent[index[idx_d], 1])
+  rr_c <- exp(samples[[i]]$latent[index[idx_c], 1])
+  joint_prob <- joint_prob + (rr_d > 1 & rr_c > 1)
+}
+joint_prob <- joint_prob / length(samples)
+
+x <- map_web
+x$probability <- unname(joint_prob[match(as.character(x$code_muni), model_data$code[idx_d])])
+x$fill <- unname(ifelse(x$probability > 0.98, "#B62828", "#F7F7F7"))
+p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+  addTiles() |>
+  fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+            bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+  addPolygons(fillColor = ~fill, fillOpacity = 0.95,
+    color = "white", weight = 0.5, opacity = 0.7,
+    label = ~paste0(name_muni, ": Joint probability = ",
+                    round(100 * probability, 2), "%")) |>
+  addLegend(position = "bottomright", colors = c("#B62828", "#F7F7F7"),
+    labels = c(">98%", "<=98%"), opacity = 0.95,
+    title = "P(both RRs > 1 | data)") |>
+  addControl(paste0("<b style='font-size:26px'>Dengue and chikungunya</b>",
+      "<br>Joint exceedance probability >98% | Minas Gerais, 2021-2025"),
+    position = "topleft") |>
+  addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+p <- htmlwidgets::prependContent(p, map_css)
+htmlwidgets::saveWidget(p, file.path(maps_dir, "joint_exceedance_98_osm.html"),
+                        selfcontained = FALSE, libdir = "leaflet_libs")
+p
+```
+
+### Static exceedance maps
+
+```{r exceedance-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- c(paste0("exceedance_98_", diseases, "_osm"), "joint_exceedance_98_osm")
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+
+red_names <- x$name_muni[which(x$probability > 0.98)]
+length(red_names)
+sort(red_names)
+```
