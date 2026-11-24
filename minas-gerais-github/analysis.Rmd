@@ -844,6 +844,9 @@ print(subset_comparison[1, ], row.names = FALSE)
 best_formula
 best_fit$summary.fixed
 best_fit$summary.hyperpar
+
+save(subset_comparison, best_formula, selected_vars, model_data,
+     graph, n, codes, selection_prior, file = "subset_run_backup.RData")
 ```
 
 # Lowest-WAIC subset: posterior inference
@@ -874,57 +877,11 @@ knitr::kable(data.frame(WAIC = selected_fit$waic$waic,
 
 # RR and total random-effect maps
 
-## Relative risks for both diseases
-
-```{r selected-rr-maps, eval=FALSE}
-rr <- read.csv(file.path(path, "data/processed/posterior_relative_risks.csv"))
-rr_maps <- list()
-for (disease in diseases) {
-  x <- map_web
-  rows <- rr[rr$disease == disease, ]
-  x$value <- rows$RR[match(x$code_muni, rows$code)]
-  p <- leaflet(x, width = 1200, height = 1000,
-    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
-    addTiles() |>
-    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
-              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
-    addPolygons(fillColor = ~risk_palette(value), fillOpacity = 0.95,
-      color = "white", weight = 0.5, opacity = 0.7,
-      label = ~paste0(name_muni, ": RR = ", round(value, 2))) |>
-    addLegend(position = "bottomright", colors = risk_colors, labels = risk_labels,
-      opacity = 0.95, title = "Relative risk") |>
-    addControl(paste0("<b style='font-size:26px'>", tools::toTitleCase(disease),
-      "</b><br>Posterior mean RR | Minas Gerais, 2021-2025"), position = "topleft") |>
-    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
-  p <- htmlwidgets::prependContent(p, map_css)
-  rr_maps[[disease]] <- p
-  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0("RR_", disease, "_osm.html")),
-                         selfcontained = FALSE, libdir = "leaflet_libs")
-}
-htmltools::tagList(rr_maps)
-```
-
-### Static maps
-
-```{r rr-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
-map_files <- paste0("RR_", diseases, "_osm")
-for (file in map_files) {
-  webshot2::webshot(
-    url = file.path(maps_dir, paste0(file, ".html")),
-    file = file.path(maps_dir, paste0(file, ".png")),
-    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
-  )
-}
-
-for (file in map_files) {
-  grid::grid.newpage()
-  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
-}
-```
 
 ## Total random-effect contributions
 
 ```{r selected-random-effect-maps, eval=FALSE}
+dir.create(maps_dir, recursive = TRUE, showWarnings = FALSE)
 fields <- c("b1", "chikungunya_total")
 field_labels <- c("Dengue random effect", "Chikungunya random effect")
 effect_breaks <- c(-Inf, -2, -1, -0.5, -0.1, 0.1, 0.5, 1, 2, Inf)
@@ -1084,7 +1041,7 @@ saveRDS(final_fit, fit_file)
 
 eta <- final_fit$summary.linear.predictor
 set.seed(123)
-samples <- inla.posterior.sample(10000, final_fit, selection = list(Predictor = 0), seed = 123, num.threads = 1)
+samples <- inla.posterior.sample(10000, final_fit, selection = list(Predictor = 0, b1 = seq_len(n), shared = seq_len(n), b2 = seq_len(n)), seed = 123, num.threads = 1)
 
 index <- match(paste0("Predictor:", seq_len(nrow(model_data))),
                rownames(samples[[1]]$latent))
@@ -1144,7 +1101,53 @@ sapply(list(dengue = den, chikungunya = chik),
        function(x) cor(x$SIR, x$RR, method = "spearman"))
 
 ```
+## Relative risks for both diseases
 
+```{r selected-rr-maps, eval=FALSE}
+rr <- read.csv(file.path(path, "data/processed/posterior_relative_risks.csv"))
+rr_maps <- list()
+for (disease in diseases) {
+  x <- map_web
+  rows <- rr[rr$disease == disease, ]
+  x$value <- rows$RR[match(x$code_muni, rows$code)]
+  p <- leaflet(x, width = 1200, height = 1000,
+    options = leafletOptions(zoomControl = FALSE, zoomSnap = 0.1)) |>
+    addTiles() |>
+    fitBounds(bounds[["xmin"]] - 0.3, bounds[["ymin"]] - 0.3,
+              bounds[["xmax"]] + 1.5, bounds[["ymax"]] + 0.3) |>
+    addPolygons(fillColor = ~risk_palette(value), fillOpacity = 0.95,
+      color = "white", weight = 0.5, opacity = 0.7,
+      label = ~paste0(name_muni, ": RR = ", round(value, 2))) |>
+    addLegend(position = "bottomright", colors = risk_colors, labels = risk_labels,
+      opacity = 0.95, title = "Relative risk") |>
+    addControl(paste0("<b style='font-size:26px'>", tools::toTitleCase(disease),
+      "</b><br>Posterior mean RR | Minas Gerais, 2021-2025"), position = "topleft") |>
+    addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE))
+  p <- htmlwidgets::prependContent(p, map_css)
+  rr_maps[[disease]] <- p
+  htmlwidgets::saveWidget(p, file.path(maps_dir, paste0("RR_", disease, "_osm.html")),
+                         selfcontained = FALSE, libdir = "leaflet_libs")
+}
+htmltools::tagList(rr_maps)
+```
+
+### Static maps
+
+```{r rr-poster-paper, eval=FALSE, fig.width=12, fig.height=10, out.width="100%"}
+map_files <- paste0("RR_", diseases, "_osm")
+for (file in map_files) {
+  webshot2::webshot(
+    url = file.path(maps_dir, paste0(file, ".html")),
+    file = file.path(maps_dir, paste0(file, ".png")),
+    vwidth = 1200, vheight = 1000, zoom = 2, delay = 20
+  )
+}
+
+for (file in map_files) {
+  grid::grid.newpage()
+  grid::grid.raster(png::readPNG(file.path(maps_dir, paste0(file, ".png"))))
+}
+```
 ## Exceedance probability maps
 
 ```{r sampled-exceedance-maps}
@@ -1239,4 +1242,20 @@ for (file in map_files) {
 red_names <- x$name_muni[which(x$probability > 0.98)]
 length(red_names)
 sort(red_names)
+```
+# correlation between the dengue and chikungunya municipal random effects 
+```{r}
+labels <- rownames(samples[[1]]$latent)
+b1 <- match(paste0("b1:", seq_len(n)), labels)
+shared <- match(paste0("shared:", seq_len(n)), labels)
+b2 <- match(paste0("b2:", seq_len(n)), labels)
+
+cors <- numeric(length(samples))    # correlation once per posterior draw.
+for (i in seq_along(samples)) {
+  x <- samples[[i]]$latent[, 1]
+  cors[i] <- cor(x[b1], x[shared] + x[b2])
+}
+
+mean(cors)  #averages the 10,000 correlations.
+quantile(cors, c(0.025, 0.975))   #lower and upper limits of their central 95% credible interval.
 ```
